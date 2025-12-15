@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI ตรวจจับวัตถุ</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- TensorFlow.js และ COCO-SSD Model -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    
+    <style>
+        body {
+            background-color: #111;
+            color: white;
+            overflow: hidden; /* ป้องกันการเลื่อนหน้าจอ */
+        }
+        #camera-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000;
+        }
+        video {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        canvas {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 10;
+        }
+        .overlay-ui {
+            position: absolute;
+            bottom: 30px;
+            left: 0;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 20;
+            gap: 10px;
+        }
+        .status-badge {
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-radius: 50%;
+            border-top: 4px solid #3b82f6;
+            width: 40px;
+            height: 40px;
+            -webkit-animation: spin 1s linear infinite; /* Safari */
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        /* สไตล์สำหรับกล่องข้อความบน Canvas */
+        .prediction-label {
+            font-family: 'Sarabun', sans-serif;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="camera-container">
+        <!-- วิดีโอสำหรับแสดงภาพจากกล้อง (ซ่อนไว้ แต่ใช้ประมวลผล) -->
+        <video id="webcam" autoplay playsinline muted></video>
+        <!-- Canvas สำหรับวาดกรอบสี่เหลี่ยม -->
+        <canvas id="canvas"></canvas>
+        
+        <!-- UI แสดงสถานะ -->
+        <div id="loading-screen" class="absolute inset-0 flex flex-col items-center justify-center bg-black z-50">
+            <div class="loader mb-4"></div>
+            <p class="text-gray-300 animate-pulse">กำลังโหลดโมเดล AI...</p>
+            <p class="text-xs text-gray-500 mt-2">กรุณาอนุญาตให้ใช้กล้อง</p>
+        </div>
+
+        <div class="overlay-ui">
+            <div id="status-text" class="status-badge hidden">พร้อมทำงาน</div>
+            
+            <button id="switch-camera-btn" class="bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-full shadow-lg active:scale-95 transition-transform flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // ตัวแปร Global
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const loadingScreen = document.getElementById('loading-screen');
+        const statusText = document.getElementById('status-text');
+        const switchBtn = document.getElementById('switch-camera-btn');
+        
+        let model = undefined;
+        let currentStream = null;
+        let facingMode = 'environment'; // เริ่มต้นด้วยกล้องหลัง
+        let isModelLoaded = false;
+
+        // ฟังก์ชันเริ่มต้นหลัก
+        async function main() {
+            try {
+                // 1. เริ่มโหลดโมเดล
+                updateStatus("กำลังโหลดโมเดล COCO-SSD...");
+                model = await cocoSsd.load();
+                isModelLoaded = true;
+                
+                // 2. ขอสิทธิ์และเปิดกล้อง
+                await setupCamera();
+                
+                // 3. ซ่อนหน้าโหลด
+                loadingScreen.style.display = 'none';
+                statusText.classList.remove('hidden');
+                updateStatus("ระบบพร้อมทำงาน");
+
+                // 4. ปรับขนาด Canvas ให้ตรงกับวิดีโอ
+                resizeCanvas();
+                window.addEventListener('resize', resizeCanvas);
+
+                // 5. เริ่มลูปการทำนาย
+                detectFrame();
+            } catch (error) {
+                console.error(error);
+                alert("เกิดข้อผิดพลาด: " + error.message);
+                updateStatus("เกิดข้อผิดพลาดในการโหลด");
+            }
+        }
+
+        // ตั้งค่ากล้อง
+        async function setupCamera() {
+            if (currentStream) {
+                currentStream.getTracks().forEach(track => track.stop());
+            }
+
+            const constraints = {
+                audio: false,
+                video: {
+                    facingMode: facingMode,
+                    // พยายามขอความละเอียดที่เหมาะสมกับมือถือ
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                }
+            };
+
+            try {
+                currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = currentStream;
+                
+                return new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        video.play();
+                        resolve();
+                    };
+                });
+            } catch (err) {
+                alert("ไม่สามารถเข้าถึงกล้องได้ กรุณาตรวจสอบสิทธิ์การใช้งาน (ต้องใช้ HTTPS หรือ localhost)");
+                throw err;
+            }
+        }
+
+        // ปรับขนาด Canvas
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+
+        // ลูปการทำงานหลัก (Detection Loop)
+        function detectFrame() {
+            if (!isModelLoaded) return;
+
+            // ตรวจจับวัตถุ
+            model.detect(video).then(predictions => {
+                renderPredictions(predictions);
+                requestAnimationFrame(detectFrame);
+            });
+        }
+
+        // วาดกรอบสี่เหลี่ยมและชื่อวัตถุ
+        function renderPredictions(predictions) {
+            // ล้างหน้าจอ Canvas ก่อนวาดใหม่
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // คำนวณอัตราส่วนเพื่อแปลงพิกัดจาก Video -> Canvas
+            // เนื่องจากเราใช้ object-fit: cover สัดส่วนอาจจะต่างกัน
+            const videoRatio = video.videoWidth / video.videoHeight;
+            const canvasRatio = canvas.width / canvas.height;
+            
+            let scale, offsetX, offsetY;
+
+            if (canvasRatio > videoRatio) {
+                scale = canvas.width / video.videoWidth;
+                offsetX = 0;
+                offsetY = (canvas.height - (video.videoHeight * scale)) / 2;
+            } else {
+                scale = canvas.height / video.videoHeight;
+                offsetX = (canvas.width - (video.videoWidth * scale)) / 2;
+                offsetY = 0;
+            }
+
+            predictions.forEach(prediction => {
+                // กรองความมั่นใจต่ำกว่า 60% ออก
+                if (prediction.score < 0.6) return;
+
+                const [x, y, width, height] = prediction.bbox;
+
+                // แปลงพิกัด
+                const drawX = (x * scale) + offsetX;
+                const drawY = (y * scale) + offsetY;
+                const drawWidth = width * scale;
+                const drawHeight = height * scale;
+
+                // เลือกสีตามคลาสของวัตถุ (สุ่มสีแบบง่ายๆ ตามตัวอักษรแรก)
+                const colorHue = (prediction.class.charCodeAt(0) * 10) % 360;
+                const color = `hsl(${colorHue}, 100%, 50%)`;
+
+                // วาดกรอบ
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 4;
+                ctx.strokeRect(drawX, drawY, drawWidth, drawHeight);
+
+                // วาดพื้นหลังข้อความ
+                const text = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
+                ctx.font = '18px Arial';
+                const textWidth = ctx.measureText(text).width;
+                
+                ctx.fillStyle = color;
+                ctx.fillRect(drawX, drawY > 25 ? drawY - 25 : drawY, textWidth + 10, 25);
+
+                // วาดข้อความ
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillText(text, drawX + 5, drawY > 25 ? drawY - 7 : drawY + 18);
+            });
+        }
+
+        function updateStatus(msg) {
+            statusText.innerText = msg;
+        }
+
+        // ปุ่มสลับกล้อง
+        switchBtn.addEventListener('click', async () => {
+            facingMode = facingMode === 'user' ? 'environment' : 'user';
+            // หมุน icon
+            switchBtn.style.transform = "rotate(180deg)";
+            await setupCamera();
+            setTimeout(() => { switchBtn.style.transform = "rotate(0deg)"; }, 300);
+        });
+
+        // เริ่มทำงานเมื่อโหลดหน้าเสร็จ
+        window.addEventListener('DOMContentLoaded', main);
+
+    </script>
+</body>
+</html>
